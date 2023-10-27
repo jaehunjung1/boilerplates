@@ -82,7 +82,7 @@ def parse_args():
     parser.add_argument(
         "--max_source_length",
         type=int,
-        default=4096,
+        default=1024,
         help=(
             "The maximum total input sequence length after tokenization. "
             "Sequences longer than this will be truncated, sequences shorter will be padded."
@@ -125,7 +125,7 @@ def parse_args():
     parser.add_argument(
         "--num_beams",
         type=int,
-        default=None,
+        default=1,
         help=(
             "Number of beams to use for evaluation. This argument will be "
             "passed to ``model.generate``, which is used during ``evaluate`` and ``predict``."
@@ -152,13 +152,13 @@ def parse_args():
     parser.add_argument(
         "--per_device_train_batch_size",
         type=int,
-        default=8,
+        default=2,
         help="Batch size (per device) for the training dataloader.",
     )
     parser.add_argument(
         "--per_device_eval_batch_size",
         type=int,
-        default=8,
+        default=4,
         help="Batch size (per device) for the evaluation dataloader.",
     )
     parser.add_argument(
@@ -191,7 +191,7 @@ def parse_args():
         "--num_warmup_steps", type=int, default=0, help="Number of steps for the warmup in the lr scheduler."
     )
     parser.add_argument("--output_dir", type=str, default="./models", help="Where to store the final model.")
-    parser.add_argument("--seed", type=int, default=None, help="A seed for reproducible training.")
+    parser.add_argument("--seed", type=int, default=42, help="A seed for reproducible training.")
     # New Code #
     parser.add_argument(
         "--logging_steps",
@@ -210,22 +210,17 @@ def parse_args():
     if args.dataset_name is None and args.train_file is None and args.validation_file is None:
         raise ValueError("Need either a dataset name or a training/validation file.")
 
+    if args.output_dir is not None and not args.with_tracking:
+        raise ValueError("Output directory should be either None or with_tracking=True")
+
     return args
 
 
-# New Code #
-def checkpoint_model(checkpoint_folder, ckpt_id, model, epoch, last_global_step, **kwargs):
+def checkpoint_model(checkpoint_folder, ckpt_id, model):
     """Utility function for checkpointing model + optimizer dictionaries
     The main purpose for this is to be able to resume training from that instant again
     """
-    checkpoint_state_dict = {
-        "epoch": epoch,
-        "last_global_step": last_global_step,
-    }
-    # Add extra kwargs too
-    checkpoint_state_dict.update(kwargs)
-
-    success = model.save_checkpoint(checkpoint_folder, ckpt_id, checkpoint_state_dict)
+    success = model.save_checkpoint(checkpoint_folder, ckpt_id)
     status_msg = f"checkpointing: checkpoint_folder={checkpoint_folder}, ckpt_id={ckpt_id}"
     if success:
         logging.info(f"Success {status_msg}")
@@ -234,7 +229,6 @@ def checkpoint_model(checkpoint_folder, ckpt_id, model, epoch, last_global_step,
     return
 
 
-# New Code #
 def evaluate(args, model, metric, tokenizer, eval_dataloader, accelerator):
     accelerator.print("starting evaluation")
     count_printed = 0
@@ -309,18 +303,6 @@ def evaluate(args, model, metric, tokenizer, eval_dataloader, accelerator):
     return result["score"]
 
 
-# New Code #
-def load_training_checkpoint(model, load_dir, tag=None, **kwargs):
-    """Utility function for checkpointing model + optimizer dictionaries
-    The main purpose for this is to be able to resume training from that instant again
-    """
-    _, checkpoint_state_dict = model.load_checkpoint(load_dir, tag=tag, **kwargs)
-    epoch = checkpoint_state_dict["epoch"]
-    last_global_step = checkpoint_state_dict["last_global_step"]
-    del checkpoint_state_dict
-    return (epoch, last_global_step)
-
-
 def main():
     args = parse_args()
 
@@ -328,7 +310,7 @@ def main():
     # If we're using tracking, we also need to initialize it here and it will by default pick up all supported trackers
     # in the environment
     accelerator = (
-        Accelerator(log_with="wandb", logging_dir=args.output_dir) if args.with_tracking else Accelerator()
+        Accelerator(log_with="wandb") if args.with_tracking else Accelerator()
     )
     # Make one log on every process with the configuration for debugging.
     logging.basicConfig(
@@ -348,10 +330,6 @@ def main():
     if args.seed is not None:
         set_seed(args.seed)
 
-    # Handle the repository creation
-    if accelerator.is_main_process:
-        if args.output_dir is not None:
-            os.makedirs(args.output_dir, exist_ok=True)
     accelerator.wait_for_everyone()
 
     # Get the datasets: you can either provide your own CSV/JSON/TXT training and evaluation files (see below)
@@ -367,9 +345,9 @@ def main():
         # Downloading and loading a dataset from the hub.
         raw_datasets = load_dataset(args.dataset_name, args.dataset_config_name)
         if args.n_train > 0:
-            raw_datasets["train"] = datasets.Dataset.from_dict(raw_datasets["train"][: args.n_train])
+            raw_datasets["train"] = datasets.Dataset.from_dict(raw_datasets["train"][:args.n_train])
         if args.n_val > 0:
-            raw_datasets["validation"] = datasets.Dataset.from_dict(raw_datasets["validation"][: args.n_val])
+            raw_datasets["validation"] = datasets.Dataset.from_dict(raw_datasets["validation"][:args.n_val])
     else:
         data_files = {}
         if args.train_file is not None:
@@ -382,50 +360,34 @@ def main():
     # https://huggingface.co/docs/datasets/loading_datasets.html.
 
     # Load pretrained model and tokenizer
-    #
-    # In distributed training, the .from_pretrained methods guarantee that only one local process can concurrently
-    # download model & vocab.
     config = AutoConfig.from_pretrained(args.model_name_or_path)
     tokenizer = AutoTokenizer.from_pretrained(args.model_name_or_path, use_fast=True)
-
-    if args.model_name_or_path:
-        model = AutoModelForSeq2SeqLM.from_pretrained(
-            args.model_name_or_path,
-            from_tf=bool(".ckpt" in args.model_name_or_path),
-            config=config,
-        )
-    else:
-        logger.info("Training new model from scratch")
-        model = AutoModelForSeq2SeqLM.from_config(config)
+    model = AutoModelForSeq2SeqLM.from_pretrained(
+        args.model_name_or_path,
+        config=config,
+    )
 
     model.resize_token_embeddings(len(tokenizer))
     if model.config.decoder_start_token_id is None:
         raise ValueError("Make sure that `config.decoder_start_token_id` is correctly defined")
 
-    prefix = args.source_prefix if args.source_prefix is not None else ""
+    prefix = ""
 
     # Preprocessing the datasets.
     # First we tokenize all the texts.
     column_names = raw_datasets["train"].column_names
 
     # Get the column names for input/target.
-    dataset_columns = column_names
-    if args.text_column is None:
-        text_column = dataset_columns[0] if dataset_columns is not None else column_names[0]
-    else:
-        text_column = args.text_column
-        if text_column not in column_names:
-            raise ValueError(
-                f"--text_column' value '{args.text_column}' needs to be one of: {', '.join(column_names)}"
-            )
-    if args.summary_column is None:
-        summary_column = dataset_columns[1] if dataset_columns is not None else column_names[1]
-    else:
-        summary_column = args.summary_column
-        if summary_column not in column_names:
-            raise ValueError(
-                f"--summary_column' value '{args.summary_column}' needs to be one of: {', '.join(column_names)}"
-            )
+    text_column = column_names[0] if args.text_column is None else args.text_column
+    if text_column not in column_names:
+        raise ValueError(
+            f"--text_column' value '{args.text_column}' needs to be one of: {', '.join(column_names)}"
+        )
+    summary_column = column_names[1] if args.summary_column is None else args.summary_column
+    if summary_column not in column_names:
+        raise ValueError(
+            f"--summary_column' value '{args.summary_column}' needs to be one of: {', '.join(column_names)}"
+        )
 
     # Temporarily set max_target_length for training.
     max_target_length = args.max_target_length
@@ -476,7 +438,7 @@ def main():
         tokenizer,
         model=model,
         label_pad_token_id=label_pad_token_id,
-        pad_to_multiple_of=8 if accelerator.use_fp16 else None,
+        pad_to_multiple_of=8 if "16" in accelerator.mixed_precision else None,
     )
 
     train_dataloader = DataLoader(
@@ -485,8 +447,7 @@ def main():
     eval_dataloader = DataLoader(eval_dataset, collate_fn=data_collator, batch_size=args.per_device_eval_batch_size)
 
     # Optimizer
-    # New Code #
-    # Creates Dummy Optimizer if `optimizer` was spcified in the config file else creates Adam Optimizer
+    # Creates Dummy Optimizer if `optimizer` was specified in the config file else creates Adam Optimizer
     optimizer_cls = (
         torch.optim.Adam
         if accelerator.state.deepspeed_plugin is None
@@ -539,6 +500,12 @@ def main():
         if accelerator.is_main_process:
             experiment_config = vars(args)
             accelerator.init_trackers("Seq2Seq_no_trainer", experiment_config)
+
+    # Create output directory
+    if accelerator.is_main_process:
+        if args.output_dir is not None:
+            args.output_dir = os.path.join(args.output_dir, accelerator.get_tracker("wandb").run.name)
+            os.makedirs(args.output_dir, exist_ok=True)
 
     # Metric
     metric = load_metric("sacrebleu")
@@ -617,22 +584,27 @@ def main():
         end_time = time()
         logger.info(f"Epoch {epoch} training took {end_time-start_time} seconds")
 
-        # New Code #
         # Save the checkpoint to the specified path
         if accelerator.state.deepspeed_plugin is not None:
-            checkpoint_model(args.output_dir, epoch, model, epoch, completed_steps)
+            checkpoint_model(args.output_dir, epoch, model)
         else:
             accelerator.wait_for_everyone()
             if accelerator.is_main_process:
                 ckpt_path = os.path.join(args.output_dir, str(epoch))
                 os.makedirs(ckpt_path, exist_ok=True)
-                accelerator.save(model.state_dict(), os.path.join(ckpt_path, "model.pt"))
+                unwrapped_model = accelerator.unwrap_model(model)
+                unwrapped_model.save_pretrained(
+                    ckpt_path,
+                    is_main_process=accelerator.is_main_process,
+                    save_function=accelerator.save,
+                )
+
         start_time = time()
         bleu_score = evaluate(args, model, metric, tokenizer, eval_dataloader, accelerator)
         end_time = time()
         logger.info(f"Epoch {epoch} evaluation took {end_time-start_time} seconds")
-        result = {}
 
+        result = {}
         if args.with_tracking:
             result["bleu_score"] = bleu_score
             result["train_loss"] = total_loss.item() / len(train_dataloader)
@@ -641,7 +613,6 @@ def main():
             result["step"] = completed_steps
             accelerator.log(result, step=completed_steps)
 
-        # New Code #
         # Tracks the best checkpoint and best metric
         if best_metric is None or best_metric < bleu_score:
             best_metric = bleu_score
@@ -649,27 +620,13 @@ def main():
             accelerator.print(f"New best metric: {best_metric} at epoch {epoch}")
             accelerator.print(f"best_metric_checkpoint: {best_metric_checkpoint}")
 
-    if args.output_dir is not None:
-        accelerator.wait_for_everyone()
-        unwrapped_model = accelerator.unwrap_model(model)
-        # New Code #
-        # Saves the whole/unpartitioned fp16 model when in ZeRO Stage-3 to the output directory if
-        # `stage3_gather_16bit_weights_on_model_save` is True in DeepSpeed Config file or
-        # `zero3_save_16bit_model` is True in DeepSpeed Plugin.
-        # For Zero Stages 1 and 2, models are saved as usual in the output directory.
-        # The model name saved is `pytorch_model.bin`
-        unwrapped_model.save_pretrained(
-            args.output_dir,
-            is_main_process=accelerator.is_main_process,
-            save_function=accelerator.save,
-            state_dict=accelerator.get_state_dict(model),
-        )
-        if accelerator.is_main_process:
-            tokenizer.save_pretrained(args.output_dir)
-
-        with open(os.path.join(args.output_dir, "all_results.json"), "w") as f:
-            json.dump({"eval_bleu": bleu_score}, f)
-
 
 if __name__ == "__main__":
     main()
+
+
+# accelerate launch --config_file=./configs/bf16_accelerate.yaml run_seq2seq_no_trainer.py --dataset_name=cnn_dailymail --dataset_config_name=3.0.0 --model_name_or_path=google/pegasus-large --with_tracking
+
+
+
+
